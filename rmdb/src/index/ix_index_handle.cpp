@@ -196,7 +196,7 @@ int IxNodeHandle::remove(const char *key) {
 
     if (pos < page_hdr->num_key && ix_compare(get_key(pos), key, file_hdr->col_types_, file_hdr->col_lens_) == 0) {
         erase_pair(pos);
-    } 
+    }
     return page_hdr->num_key;
 }
 
@@ -230,8 +230,14 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
     // 1. 获取根节点
     // 2. 从根节点开始不断向下查找目标key
     // 3. 找到包含该key值的叶子结点停止查找，并返回叶子节点
+    IxNodeHandle *node = fetch_node(file_hdr_->root_page_);
 
-    return std::make_pair(nullptr, false);
+    while (!node->is_leaf_page()) {
+        page_id_t child_page_no = node->internal_lookup(key);
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        node = fetch_node(child_page_no);
+    }
+    return std::make_pair(node, false);
 }
 
 /**
@@ -248,8 +254,16 @@ bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transac
     // 2. 在叶子节点中查找目标key值的位置，并读取key对应的rid
     // 3. 把rid存入result参数中
     // 提示：使用完buffer_pool提供的page之后，记得unpin page；记得处理并发的上锁
+    auto [leaf_node, root_latched] = find_leaf_page(key, Operation::FIND, transaction);
 
-    return false;
+    Rid *rid = nullptr;
+    bool found = leaf_node->leaf_lookup(key, &rid);
+
+    if (found) {
+        result->push_back(*rid);
+    }
+    buffer_pool_manager_->unpin_page(leaf_node->get_page_id(), false);
+    return found;
 }
 
 /**
