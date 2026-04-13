@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <shared_mutex>
+
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
@@ -167,7 +169,7 @@ class IxIndexHandle {
     BufferPoolManager *buffer_pool_manager_;
     int fd_;                                    // 存储B+树的文件
     IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
-    std::mutex root_latch_;
+    std::shared_mutex root_latch_;
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
@@ -224,6 +226,11 @@ class IxIndexHandle {
     void release_node_handle(IxNodeHandle &node);
 
     void maintain_child(IxNodeHandle *node, int child_idx);
+
+    // for concurrency control
+    void release_latch_page_set(Transaction *transaction, bool exclusive = true);
+
+    void latch_unlock_node(IxNodeHandle *node, bool exclusive = true);
 
     // for index test
     Rid get_rid(const Iid &iid) const;
