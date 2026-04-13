@@ -210,9 +210,8 @@ IxIndexHandle::IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffe
     file_hdr_ = new IxFileHdr();
     file_hdr_->deserialize(buf);
     
-    // disk_manager管理的fd对应的文件中，设置从file_hdr_->num_pages开始分配page_no
-    int now_page_no = disk_manager_->get_fd2pageno(fd);
-    disk_manager_->set_fd2pageno(fd, now_page_no + 1);
+    // disk_manager管理的fd对应的文件中，设置从file_hdr_->num_pages_开始分配page_no
+    disk_manager_->set_fd2pageno(fd, file_hdr_->num_pages_);
 }
 
 /**
@@ -299,6 +298,9 @@ IxNodeHandle *IxIndexHandle::split(IxNodeHandle *node) {
         new_node->set_next_leaf(node->get_next_leaf());
         new_node->set_prev_leaf(node->get_page_no());
         node->set_next_leaf(new_node->get_page_no());
+        if (file_hdr_->last_leaf_ == node->get_page_no()) {
+            file_hdr_->last_leaf_ = new_node->get_page_no();
+        }
 
         if (new_node->get_next_leaf() != INVALID_PAGE_ID) {
             IxNodeHandle *next_node = fetch_node(new_node->get_next_leaf());
@@ -594,7 +596,6 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
     (*parent)->erase_pair(index - 1);
     buffer_pool_manager_->unpin_page(node_handle->get_page_id(), true);
     bool result = coalesce_or_redistribute(*parent, transaction, root_is_latched);
-    buffer_pool_manager_->unpin_page((*parent)->get_page_id(), true);
     return result;
 }
 
@@ -625,8 +626,17 @@ Rid IxIndexHandle::get_rid(const Iid &iid) const {
  * 可用*(int *)key转换回去
  */
 Iid IxIndexHandle::lower_bound(const char *key) {
-
-    return Iid{-1, -1};
+    auto [leaf, root_latched] = find_leaf_page(key, Operation::FIND, nullptr, true);
+    int slot_no = leaf->lower_bound(key);
+    while (slot_no == leaf->get_size() && leaf->get_page_no() != file_hdr_->last_leaf_) {
+        page_id_t next_page_no = leaf->get_next_leaf();
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        leaf = fetch_node(next_page_no);
+        slot_no = leaf->lower_bound(key);
+    }
+    Iid iid{leaf->get_page_no(), slot_no};
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    return iid;
 }
 
 /**
@@ -636,8 +646,17 @@ Iid IxIndexHandle::lower_bound(const char *key) {
  * @return Iid
  */
 Iid IxIndexHandle::upper_bound(const char *key) {
-    
-    return Iid{-1, -1};
+    auto [leaf, root_latched] = find_leaf_page(key, Operation::FIND, nullptr, true);
+    int slot_no = leaf->upper_bound(key);
+    while (slot_no == leaf->get_size() && leaf->get_page_no() != file_hdr_->last_leaf_) {
+        page_id_t next_page_no = leaf->get_next_leaf();
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        leaf = fetch_node(next_page_no);
+        slot_no = leaf->upper_bound(key);
+    }
+    Iid iid{leaf->get_page_no(), slot_no};
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    return iid;
 }
 
 /**
