@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <shared_mutex>
+
 #include "common/config.h"
 
 /**
@@ -71,20 +73,42 @@ class Page {
 
     inline void set_page_lsn(lsn_t page_lsn) { memcpy(get_data() + OFFSET_LSN, &page_lsn, sizeof(lsn_t)); }
 
-   private:
-    void reset_memory() { memset(data_, OFFSET_PAGE_START, PAGE_SIZE); }  // 将data_的PAGE_SIZE个字节填充为0
+    inline std::shared_mutex &get_latch() { return latch_; }
 
-    /** page的唯一标识符 */
+    inline void latch_lock(bool exclusive = false) {
+        if (exclusive) {
+            latch_.lock();
+        } else {
+            latch_.lock_shared();
+        }
+    }
+
+    inline void latch_unlock(bool exclusive = false) {
+        if (exclusive) {
+            latch_.unlock();
+        } else {
+            latch_.unlock_shared();
+        }
+    }
+
+    inline bool latch_try_lock(bool exclusive = false) {
+        if (exclusive) {
+            return latch_.try_lock();
+        } else {
+            return latch_.try_lock_shared();
+        }
+    }
+
+   private:
+    void reset_memory() { memset(data_, OFFSET_PAGE_START, PAGE_SIZE); }
+
     PageId id_;
 
-    /** The actual data that is stored within a page.
-     *  该页面在bufferPool中的偏移地址
-     */
     char data_[PAGE_SIZE] = {};
 
-    /** 脏页判断 */
     bool is_dirty_ = false;
 
-    /** The pin count of this page. */
     int pin_count_ = 0;
+
+    std::shared_mutex latch_;
 };
