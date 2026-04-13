@@ -149,12 +149,12 @@ class IxNodeHandle {
      */
     int find_child(IxNodeHandle *child) {
         int rid_idx;
-        for (rid_idx = 0; rid_idx < page_hdr->num_key; rid_idx++) {
+        for (rid_idx = 0; rid_idx < page_hdr->num_key + 1; rid_idx++) {
             if (get_rid(rid_idx)->page_no == child->get_page_no()) {
                 break;
             }
         }
-        assert(rid_idx < page_hdr->num_key);
+        assert(rid_idx < page_hdr->num_key + 1);
         return rid_idx;
     }
 };

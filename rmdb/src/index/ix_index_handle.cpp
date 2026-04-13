@@ -97,7 +97,7 @@ page_id_t IxNodeHandle::internal_lookup(const char *key) {
     // 2. 获取该孩子节点（子树）所在页面的编号
     // 3. 返回页面编号
     int pos = upper_bound(key);
-    return get_rid(pos - 1)->page_no;
+    return get_rid(pos)->page_no;
 }
 
 /**
@@ -126,14 +126,27 @@ void IxNodeHandle::insert_pairs(int pos, const char *key, const Rid *rid, int n)
     int old_num = page_hdr->num_key;
     int col_len = file_hdr->col_tot_len_;
 
-    for (int i = old_num - 1; i >= pos; i--) {
-        set_key(i + n, get_key(i));
-        set_rid(i + n, *get_rid(i));
-    }
+    if (is_leaf_page()) {
+        for (int i = old_num - 1; i >= pos; i--) {
+            set_key(i + n, get_key(i));
+            set_rid(i + n, *get_rid(i));
+        }
 
-    for (int i = 0; i < n; i++) {
-        set_key(pos + i, key + i * col_len);
-        set_rid(pos + i, rid[i]);
+        for (int i = 0; i < n; i++) {
+            set_key(pos + i, key + i * col_len);
+            set_rid(pos + i, rid[i]);
+        }
+    } else {
+        for (int i = old_num - 1; i >= pos; --i) {
+            set_key(i + n, get_key(i));
+        }
+        for (int i = old_num; i >= pos + 1; --i) {
+            set_rid(i + n, *get_rid(i));
+        }
+        for (int i = 0; i < n; ++i) {
+            set_key(pos + i, key + i * col_len);
+            set_rid(pos + 1 + i, rid[i]);
+        }
     }
     page_hdr->num_key += n;
 }
@@ -173,9 +186,18 @@ void IxNodeHandle::erase_pair(int pos) {
     if (pos < 0 || pos >= page_hdr->num_key) {
         return;
     }
-    for (int i = pos; i < page_hdr->num_key - 1; i++) {
-        set_key(i, get_key(i + 1));
-        set_rid(i, *get_rid(i + 1));
+    if (is_leaf_page()) {
+        for (int i = pos; i < page_hdr->num_key - 1; i++) {
+            set_key(i, get_key(i + 1));
+            set_rid(i, *get_rid(i + 1));
+        }
+    } else {
+        for (int i = pos; i < page_hdr->num_key - 1; ++i) {
+            set_key(i, get_key(i + 1));
+        }
+        for (int i = pos + 1; i < page_hdr->num_key; ++i) {
+            set_rid(i, *get_rid(i + 1));
+        }
     }
     page_hdr->num_key -= 1;
 }
@@ -264,7 +286,15 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
     node->page->latch_lock(true);               // exclusive latch on root
 
     while (!node->is_leaf_page()) {
-        page_id_t child_page_no = find_first ? node->value_at(0) : node->internal_lookup(key);
+        page_id_t child_page_no;
+        if (find_first) {
+            child_page_no = node->value_at(0);
+        } else if (operation == Operation::FIND) {
+            int pos = node->lower_bound(key);
+            child_page_no = node->value_at(pos);
+        } else {
+            child_page_no = node->internal_lookup(key);
+        }
         IxNodeHandle *child = fetch_node(child_page_no);
         child->page->latch_lock(true);          // exclusive latch on child
 
@@ -313,13 +343,78 @@ bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transac
     // 2. 在叶子节点中查找目标key值的位置，并读取key对应的rid
     // 3. 把rid存入result参数中
     // 提示：使用完buffer_pool提供的page之后，记得unpin page；记得处理并发的上锁
+    if (is_empty()) {
+        return false;
+    }
+
     auto [leaf_node, root_latched] = find_leaf_page(key, Operation::FIND, transaction);
 
-    Rid *rid = nullptr;
-    bool found = leaf_node->leaf_lookup(key, &rid);
+    int pos = leaf_node->lower_bound(key);
+    bool found = false;
 
-    if (found) {
-        result->push_back(*rid);
+    // Scan backwards if pos == 0, because previous leaves might also contain the duplicate key
+    while (pos == 0 && leaf_node->get_prev_leaf() != INVALID_PAGE_ID && leaf_node->get_prev_leaf() != IX_LEAF_HEADER_PAGE) {
+        page_id_t prev_page = leaf_node->get_prev_leaf();
+        if (prev_page == leaf_node->get_page_no()) break;
+        
+        IxNodeHandle *prev_node = fetch_node(prev_page);
+        if (prev_node->get_size() == 0 || ix_compare(prev_node->get_key(prev_node->get_size() - 1), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
+            buffer_pool_manager_->unpin_page(prev_node->get_page_id(), false);
+            delete prev_node;
+            break;
+        }
+        
+        leaf_node->page->latch_unlock(false);
+        buffer_pool_manager_->unpin_page(leaf_node->get_page_id(), false);
+        delete leaf_node;
+        
+        leaf_node = prev_node;
+        leaf_node->page->latch_lock(false);
+        pos = leaf_node->lower_bound(key);
+    }
+
+    while (pos < leaf_node->get_size() && ix_compare(leaf_node->get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
+        result->push_back(*leaf_node->get_rid(pos));
+        found = true;
+        pos++;
+    }
+
+    IxNodeHandle *curr_leaf = leaf_node;
+    int hop_cnt = 0;
+    while (pos == curr_leaf->get_size() && curr_leaf->get_next_leaf() != INVALID_PAGE_ID &&
+           curr_leaf->get_next_leaf() != IX_LEAF_HEADER_PAGE &&
+           hop_cnt < file_hdr_->num_pages_) {
+        page_id_t next_page = curr_leaf->get_next_leaf();
+        if (next_page == curr_leaf->get_page_no()) {
+            break;
+        }
+        if (curr_leaf != leaf_node) {
+            curr_leaf->page->latch_unlock(false);
+            buffer_pool_manager_->unpin_page(curr_leaf->get_page_id(), false);
+            delete curr_leaf;
+        }
+        curr_leaf = fetch_node(next_page);
+        curr_leaf->page->latch_lock(false);
+        hop_cnt++;
+        pos = 0;
+        while (pos < curr_leaf->get_size() && ix_compare(curr_leaf->get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0) {
+            result->push_back(*curr_leaf->get_rid(pos));
+            found = true;
+            pos++;
+        }
+        if (pos < curr_leaf->get_size()) {
+            break;
+        }
+    }
+
+    if (curr_leaf != leaf_node) {
+        curr_leaf->page->latch_unlock(false);
+        buffer_pool_manager_->unpin_page(curr_leaf->get_page_id(), false);
+        delete curr_leaf;
+    }
+
+    if (root_latched) {
+        root_latch_.unlock_shared();
     }
 
     release_latch_page_set(transaction, false);
@@ -376,14 +471,15 @@ IxNodeHandle *IxIndexHandle::split(IxNodeHandle *node) {
         }
     }
     else {
-        for (int i = mid + 1; i < total; i++) {
-            new_node->set_key(i - mid - 1, node->get_key(i));
-            new_node->set_rid(i - mid, *node->get_rid(i));
+        int right_size = total - mid - 1;
+        for (int j = 0; j < right_size; ++j) {
+            new_node->set_key(j, node->get_key(mid + 1 + j));
+            new_node->set_rid(j, *node->get_rid(mid + 1 + j));
         }
-        new_node->set_rid(0, *node->get_rid(mid));
+        new_node->set_rid(right_size, *node->get_rid(total));
 
         node->set_size(mid);
-        new_node->set_size(total - mid - 1);
+        new_node->set_size(right_size);
         for (int i = 0; i < new_node->get_size() + 1; i++) {
             maintain_child(new_node, i);
         }
@@ -433,13 +529,27 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
         IxNodeHandle *parent = fetch_node(old_node->get_parent_page_no());
         int pos = parent->find_child(old_node);
         Rid new_rid{new_node->get_page_no(), -1};
-        parent->insert_pairs(pos + 1, key, &new_rid, 1);
+
+        int old_size = parent->get_size();
+        for (int i = old_size + 1; i > pos + 1; --i) {
+            parent->set_rid(i, *parent->get_rid(i - 1));
+        }
+        for (int i = old_size - 1; i >= pos; --i) {
+            parent->set_key(i + 1, parent->get_key(i));
+        }
+        parent->set_key(pos, key);
+        parent->set_rid(pos + 1, new_rid);
+        parent->set_size(old_size + 1);
 
         if (parent->get_size() == parent->get_max_size()) {
+            int mid = parent->get_size() / 2;
+            char *up_key = new char[file_hdr_->col_tot_len_];
+            memcpy(up_key, parent->get_key(mid), file_hdr_->col_tot_len_);
             IxNodeHandle *split_node = split(parent);
-            insert_into_parent(parent, split_node->get_key(0), split_node, transaction);
+            insert_into_parent(parent, up_key, split_node, transaction);
             buffer_pool_manager_->unpin_page(split_node->get_page_id(), true);
             delete split_node;
+            delete[] up_key;
         }
         buffer_pool_manager_->unpin_page(parent->get_page_id(), true);
         delete parent;
@@ -458,10 +568,31 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     // 2. 在该叶子节点中插入键值对
     // 3. 如果结点已满，分裂结点，并把新结点的相关信息插入父节点
     // 提示：记得unpin page；若当前叶子节点是最右叶子节点，则需要更新file_hdr_.last_leaf；记得处理并发的上锁
+    if (is_empty()) {
+        IxNodeHandle *root = create_node();
+        file_hdr_->root_page_ = root->get_page_no();
+        file_hdr_->first_leaf_ = root->get_page_no();
+        file_hdr_->last_leaf_ = root->get_page_no();
+        root->page_hdr->is_leaf = true;
+        root->page_hdr->parent = INVALID_PAGE_ID;
+        root->page_hdr->num_key = 0;
+        root->page_hdr->prev_leaf = IX_LEAF_HEADER_PAGE;
+        root->page_hdr->next_leaf = IX_LEAF_HEADER_PAGE;
+        buffer_pool_manager_->unpin_page(root->get_page_id(), true);
+        delete root;
+    }
+
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::INSERT, transaction, false);
 
     int pos = leaf->lower_bound(key);
     leaf->insert_pairs(pos, key, &value, 1);
+
+    // 在分裂前释放祖先 latch 和 unpin，避免 buffer pool 耗尽
+    if (root_is_latched) {
+        root_latch_.unlock();
+        root_is_latched = false;
+    }
+    release_latch_page_set(transaction, true);
 
     if (leaf->get_size() == leaf->get_max_size()) {
         IxNodeHandle *new_node = split(leaf);
@@ -471,10 +602,6 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     }
 
     page_id_t page_no = leaf->get_page_no();
-
-    if (root_is_latched) {
-        root_latch_.unlock();
-    }
 
     release_latch_page_set(transaction, true);
     leaf->page->latch_unlock(true);
@@ -495,6 +622,10 @@ bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
     // 2. 在该叶子结点中删除键值对
     // 3. 如果删除成功需要调用CoalesceOrRedistribute来进行合并或重分配操作，并根据函数返回结果判断是否有结点需要删除
     // 4. 如果需要并发，并且需要删除叶子结点，则需要在事务的delete_page_set中添加删除结点的对应页面；记得处理并发的上锁
+    if (is_empty()) {
+        return false;
+    }
+
     auto [leaf, root_is_latched] = find_leaf_page(key, Operation::DELETE, transaction, false);
 
     int pos = leaf->lower_bound(key);
@@ -511,6 +642,18 @@ bool IxIndexHandle::delete_entry(const char *key, Transaction *transaction) {
     }
 
     leaf->erase_pair(pos);
+
+    if (pos == 0 && leaf->get_size() > 0 && leaf->get_parent_page_no() != IX_NO_PAGE) {
+        maintain_parent(leaf);
+    }
+
+    // 在合并/重分配前释放祖先 latch 和 unpin，避免 buffer pool 耗尽
+    if (root_is_latched) {
+        root_latch_.unlock();
+        root_is_latched = false;
+    }
+    release_latch_page_set(transaction, true);
+
     coalesce_or_redistribute(leaf, transaction, &root_is_latched);
 
     if (root_is_latched) {
@@ -549,6 +692,11 @@ bool IxIndexHandle::coalesce_or_redistribute(IxNodeHandle *node, Transaction *tr
     if (node->is_root_page()) {
         return adjust_root(node);
     }
+
+    if (node->get_size() >= node->get_min_size()) {
+        return false;
+    }
+
     IxNodeHandle *parent = fetch_node(node->get_parent_page_no());
     int index = parent->find_child(node);
     int min_size = node->get_min_size();
@@ -590,7 +738,7 @@ bool IxIndexHandle::adjust_root(IxNodeHandle *old_root_node) {
             return true;
         }
     } else {
-        if (old_root_node->get_size() == 1) {
+        if (old_root_node->get_size() == 0) {
             IxNodeHandle *new_root = fetch_node(old_root_node->get_rid(0)->page_no);
             new_root->set_parent_page_no(INVALID_PAGE_ID);
             file_hdr_->root_page_ = new_root->get_page_no();
@@ -621,23 +769,58 @@ void IxIndexHandle::redistribute(IxNodeHandle *neighbor_node, IxNodeHandle *node
     // 2. 从neighbor_node中移动一个键值对到node结点中
     // 3. 更新父节点中的相关信息，并且修改移动键值对对应孩字结点的父结点信息（maintain_child函数）
     // 注意：neighbor_node的位置不同，需要移动的键值对不同，需要分类讨论
-    if (index == 0) {
-        int pos = 0;
-        const char *key = neighbor_node->get_key(pos);
-        const Rid *rid = neighbor_node->get_rid(pos);
-        node->insert_pairs(node->get_size(), key, rid, 1);
-        parent->set_key(0, neighbor_node->get_key(1));
-        neighbor_node->erase_pair(pos);
-    } else {
-        int pos = neighbor_node->get_size() - 1;
-        const char *key = neighbor_node->get_key(pos);
-        const Rid *rid = neighbor_node->get_rid(pos + 1);
-        node->insert_pairs(0, key, rid, 1);
-        parent->set_key(index - 1, key);
-        neighbor_node->erase_pair(pos);
-        if (!node->is_leaf_page()) {
-            maintain_child(node, 0);
+    if (node->is_leaf_page()) {
+        if (index == 0) {
+            const char *key = neighbor_node->get_key(0);
+            const Rid *rid = neighbor_node->get_rid(0);
+            node->insert_pairs(node->get_size(), key, rid, 1);
+            neighbor_node->erase_pair(0);
+            parent->set_key(0, neighbor_node->get_key(0));
+        } else {
+            int pos = neighbor_node->get_size() - 1;
+            const char *key = neighbor_node->get_key(pos);
+            const Rid *rid = neighbor_node->get_rid(pos);
+            node->insert_pairs(0, key, rid, 1);
+            neighbor_node->erase_pair(pos);
+            parent->set_key(index - 1, node->get_key(0));
         }
+        return;
+    }
+
+    if (index == 0) {
+        int node_size = node->get_size();
+        node->set_key(node_size, parent->get_key(0));
+        node->set_rid(node_size + 1, *neighbor_node->get_rid(0));
+        node->set_size(node_size + 1);
+        maintain_child(node, node_size + 1);
+
+        parent->set_key(0, neighbor_node->get_key(0));
+
+        int neigh_size = neighbor_node->get_size();
+        for (int i = 0; i < neigh_size - 1; ++i) {
+            neighbor_node->set_key(i, neighbor_node->get_key(i + 1));
+        }
+        for (int i = 0; i < neigh_size; ++i) {
+            neighbor_node->set_rid(i, *neighbor_node->get_rid(i + 1));
+        }
+        neighbor_node->set_size(neigh_size - 1);
+    } else {
+        int node_size = node->get_size();
+        for (int i = node_size - 1; i >= 0; --i) {
+            node->set_key(i + 1, node->get_key(i));
+        }
+        for (int i = node_size; i >= 0; --i) {
+            node->set_rid(i + 1, *node->get_rid(i));
+        }
+
+        int neigh_size = neighbor_node->get_size();
+        node->set_key(0, parent->get_key(index - 1));
+        node->set_rid(0, *neighbor_node->get_rid(neigh_size));
+        node->set_size(node_size + 1);
+        maintain_child(node, 0);
+
+        parent->set_key(index - 1, neighbor_node->get_key(neigh_size - 1));
+        neighbor_node->set_size(neigh_size - 1);
     }
 }
 
@@ -664,21 +847,21 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
     // 提示：如果是叶子结点且为最右叶子结点，需要更新file_hdr_.last_leaf
     IxNodeHandle *node_handle = *node;
     IxNodeHandle *neighbor = *neighbor_node;
+    int parent_index = index;
     if (index == 0) {
         std::swap(neighbor, node_handle);
         std::swap(*neighbor_node, *node);
-        index = 1;
+        parent_index = 1;
     }
-    for (int i = 0; i < node_handle->get_size(); i++) {
-        neighbor->set_key(neighbor->get_size() + i, node_handle->get_key(i));
-        neighbor->set_rid(neighbor->get_size() + i, *node_handle->get_rid(i));
-    }
-    neighbor->set_size(neighbor->get_size() + node_handle->get_size());
-    if (!node_handle->is_leaf_page()) {
-        for (int i = 0; i < node_handle->get_size() + 1; i++) {
-            maintain_child(neighbor, neighbor->get_size() - node_handle->get_size() + i);
+    if (node_handle->is_leaf_page()) {
+        int left_size = neighbor->get_size();
+        int right_size = node_handle->get_size();
+        for (int i = 0; i < right_size; i++) {
+            neighbor->set_key(left_size + i, node_handle->get_key(i));
+            neighbor->set_rid(left_size + i, *node_handle->get_rid(i));
         }
-    } else {
+        neighbor->set_size(left_size + right_size);
+
         if (node_handle->get_page_no() == file_hdr_->last_leaf_) {
             file_hdr_->last_leaf_ = neighbor->get_page_no();
         }
@@ -687,9 +870,24 @@ bool IxIndexHandle::coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, 
             IxNodeHandle *next_node = fetch_node(node_handle->get_next_leaf());
             next_node->set_prev_leaf(neighbor->get_page_no());
             buffer_pool_manager_->unpin_page(next_node->get_page_id(), true);
+            delete next_node;
+        }
+    } else {
+        int left_size = neighbor->get_size();
+        int right_size = node_handle->get_size();
+
+        neighbor->set_key(left_size, (*parent)->get_key(parent_index - 1));
+        neighbor->set_rid(left_size + 1, *node_handle->get_rid(0));
+        for (int i = 0; i < right_size; ++i) {
+            neighbor->set_key(left_size + 1 + i, node_handle->get_key(i));
+            neighbor->set_rid(left_size + 2 + i, *node_handle->get_rid(i + 1));
+        }
+        neighbor->set_size(left_size + 1 + right_size);
+        for (int i = left_size + 1; i <= neighbor->get_size(); ++i) {
+            maintain_child(neighbor, i);
         }
     }
-    (*parent)->erase_pair(index - 1);
+    (*parent)->erase_pair(parent_index - 1);
     buffer_pool_manager_->unpin_page(node_handle->get_page_id(), true);
     bool result = coalesce_or_redistribute(*parent, transaction, root_is_latched);
     return result;
@@ -737,6 +935,9 @@ Iid IxIndexHandle::lower_bound(const char *key) {
         slot_no = leaf->lower_bound(key);
     }
     Iid iid{leaf->get_page_no(), slot_no};
+    if (root_latched) {
+        root_latch_.unlock_shared();
+    }
     leaf->page->latch_unlock(false);
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
     delete leaf;
@@ -762,6 +963,9 @@ Iid IxIndexHandle::upper_bound(const char *key) {
         slot_no = leaf->upper_bound(key);
     }
     Iid iid{leaf->get_page_no(), slot_no};
+    if (root_latched) {
+        root_latch_.unlock_shared();
+    }
     leaf->page->latch_unlock(false);
     buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
     delete leaf;
@@ -825,6 +1029,11 @@ IxNodeHandle *IxIndexHandle::create_node() {
     // 从3开始分配page_no，第一次分配之后，new_page_id.page_no=3，file_hdr_.num_pages=4
     Page *page = buffer_pool_manager_->new_page(&new_page_id);
     node = new IxNodeHandle(file_hdr_, page);
+    node->page_hdr->num_key = 0;
+    node->page_hdr->parent = INVALID_PAGE_ID;
+    node->page_hdr->is_leaf = true;
+    node->page_hdr->prev_leaf = INVALID_PAGE_ID;
+    node->page_hdr->next_leaf = INVALID_PAGE_ID;
     return node;
 }
 
@@ -839,13 +1048,17 @@ void IxIndexHandle::maintain_parent(IxNodeHandle *node) {
         // Load its parent
         IxNodeHandle *parent = fetch_node(curr->get_parent_page_no());
         int rank = parent->find_child(curr);
-        char *parent_key = parent->get_key(rank);
         char *child_first_key = curr->get_key(0);
-        if (memcmp(parent_key, child_first_key, file_hdr_->col_tot_len_) == 0) {
-            assert(buffer_pool_manager_->unpin_page(parent->get_page_id(), true));
-            break;
+
+        if (rank > 0) {
+            char *parent_key = parent->get_key(rank - 1);
+            if (memcmp(parent_key, child_first_key, file_hdr_->col_tot_len_) == 0) {
+                assert(buffer_pool_manager_->unpin_page(parent->get_page_id(), false));
+                delete parent;
+                break;
+            }
+            memcpy(parent_key, child_first_key, file_hdr_->col_tot_len_);  // 修改了parent node
         }
-        memcpy(parent_key, child_first_key, file_hdr_->col_tot_len_);  // 修改了parent node
         curr = parent;
 
         assert(buffer_pool_manager_->unpin_page(parent->get_page_id(), true));
