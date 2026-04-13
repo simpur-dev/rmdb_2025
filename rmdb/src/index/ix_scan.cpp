@@ -10,21 +10,29 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 
-/**
- * @brief 
- * @todo 加上读锁（需要使用缓冲池得到page）
- */
 void IxScan::next() {
     assert(!is_end());
-    IxNodeHandle *node = ih_->fetch_node(iid_.page_no);
-    assert(node->is_leaf_page());
-    assert(iid_.slot_no < node->get_size());
-    // increment slot no
+
+    if (current_page_ == nullptr) {
+        current_page_ = bpm_->fetch_page(PageId{ih_->fd_, iid_.page_no});
+        current_page_->latch_lock(false);
+    }
+
+    IxNodeHandle node(ih_->file_hdr_, current_page_);
+    assert(node.is_leaf_page());
+    assert(iid_.slot_no < node.get_size());
+
     iid_.slot_no++;
-    if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == node->get_size()) {
-        // go to next leaf
+    if (iid_.page_no != ih_->file_hdr_->last_leaf_ && iid_.slot_no == node.get_size()) {
         iid_.slot_no = 0;
-        iid_.page_no = node->get_next_leaf();
+        page_id_t next_page_no = node.get_next_leaf();
+        iid_.page_no = next_page_no;
+
+        current_page_->latch_unlock(false);
+        bpm_->unpin_page(current_page_->get_page_id(), false);
+
+        current_page_ = bpm_->fetch_page(PageId{ih_->fd_, next_page_no});
+        current_page_->latch_lock(false);
     }
 }
 

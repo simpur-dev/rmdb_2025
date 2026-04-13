@@ -20,13 +20,21 @@ See the Mulan PSL v2 for more details. */
 // TODO：对page遍历时，要加上读锁
 class IxScan : public RecScan {
     const IxIndexHandle *ih_;
-    Iid iid_;  // 初始为lower（用于遍历的指针）
-    Iid end_;  // 初始为upper
+    Iid iid_;
+    Iid end_;
     BufferPoolManager *bpm_;
+    Page *current_page_ = nullptr;
 
    public:
     IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, BufferPoolManager *bpm)
         : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {}
+
+    ~IxScan() {
+        if (current_page_ != nullptr) {
+            current_page_->latch_unlock(false);
+            bpm_->unpin_page(current_page_->get_page_id(), false);
+        }
+    }
 
     void next() override;
 
