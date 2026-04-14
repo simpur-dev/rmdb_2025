@@ -1,5 +1,8 @@
-add_executable(record_index_test record_index_test.cpp)
+add_executable(record_index_test record_index_test/record_index_test.cpp)
 target_link_libraries(record_index_test storage lru_replacer record index system transaction gtest_main)
 
-add_executable(record_index_deep_test record_index_deep_test.cpp)
+add_executable(record_index_deep_test record_index_test/record_index_deep_test.cpp)
 target_link_libraries(record_index_deep_test storage lru_replacer record index system transaction gtest_main)
+
+add_executable(executor_scan_test executor_test/executor_scan_test.cpp)
+target_link_libraries(executor_scan_test storage lru_replacer record index system transaction execution gtest_main)

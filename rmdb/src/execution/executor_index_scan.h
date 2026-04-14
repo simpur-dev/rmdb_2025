@@ -66,34 +66,67 @@ class IndexScanExecutor : public AbstractExecutor {
 
     void beginTuple() override {
         IxIndexHandle *ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
-        
-        Iid lower, upper;
-        
-        char *lower_key = new char[index_meta_.col_tot_len];
-        char *upper_key = new char[index_meta_.col_tot_len];
-        memset(lower_key, 0, index_meta_.col_tot_len);
-        memset(upper_key, 0, index_meta_.col_tot_len);
-        
-        for (auto &col : index_meta_.cols) {
+
+        // 构建索引扫描的上下界 key
+        // 注意：索引键中各列的偏移量需要按索引列顺序累加，而非使用记录中的 col.offset
+        int key_len = index_meta_.col_tot_len;
+        char *lower_key = new char[key_len];
+        char *upper_key = new char[key_len];
+        memset(lower_key, 0, key_len);
+        memset(upper_key, 0xFF, key_len);  // upper_key 初始化为最大值
+
+        bool has_lower = false;
+        bool has_upper = false;
+
+        // 计算每个索引列在索引键中的偏移量（按索引列顺序累加）
+        int key_offset = 0;
+        for (auto &idx_col : index_meta_.cols) {
             for (auto &cond : fed_conds_) {
-                if (cond.is_rhs_val && cond.lhs_col.col_name == col.name) {
-                    if (cond.op == OP_EQ) {
-                        memcpy(lower_key + col.offset, cond.rhs_val.raw->data, col.len);
-                        memcpy(upper_key + col.offset, cond.rhs_val.raw->data, col.len);
-                    }
-                    break;
+                if (!cond.is_rhs_val || cond.lhs_col.col_name != idx_col.name) {
+                    continue;
+                }
+                char *val_data = cond.rhs_val.raw->data;
+                switch (cond.op) {
+                    case OP_EQ:
+                        memcpy(lower_key + key_offset, val_data, idx_col.len);
+                        memcpy(upper_key + key_offset, val_data, idx_col.len);
+                        has_lower = true;
+                        has_upper = true;
+                        break;
+                    case OP_GT:
+                    case OP_GE:
+                        memcpy(lower_key + key_offset, val_data, idx_col.len);
+                        has_lower = true;
+                        break;
+                    case OP_LT:
+                    case OP_LE:
+                        memcpy(upper_key + key_offset, val_data, idx_col.len);
+                        has_upper = true;
+                        break;
+                    default:
+                        break;
                 }
             }
+            key_offset += idx_col.len;
         }
-        
-        lower = ih->lower_bound(lower_key);
-        upper = ih->upper_bound(upper_key);
-        
+
+        Iid lower, upper;
+        if (has_lower) {
+            lower = ih->lower_bound(lower_key);
+        } else {
+            lower = ih->leaf_begin();
+        }
+        if (has_upper) {
+            upper = ih->upper_bound(upper_key);
+        } else {
+            upper = ih->leaf_end();
+        }
+
         delete[] lower_key;
         delete[] upper_key;
-        
+
         scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
-        
+
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto rec = fh_->get_record(rid_, context_);
@@ -122,6 +155,10 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         rid_ = scan_->rid();
         return fh_->get_record(rid_, context_);
+    }
+
+    bool is_end() const override {
+        return scan_ == nullptr || scan_->is_end();
     }
 
     Rid &rid() override { return rid_; }
@@ -155,7 +192,6 @@ private:
         auto lhs_col = get_col_offset(cond.lhs_col);
 
         char *lhs_data = const_cast<char *>(record_data) + lhs_col.offset;
-
         ColType lhs_type = lhs_col.type;
         int lhs_len = lhs_col.len;
 
@@ -165,6 +201,7 @@ private:
         } else {
             auto rhs_col = get_col_offset(cond.rhs_col);
             char *rhs_data = const_cast<char *>(record_data) + rhs_col.offset;
+            // 使用左侧类型进行比较（查询优化器保证两侧类型一致）
             return compare_values(lhs_data, rhs_data, lhs_type, lhs_len, cond.op);
         }
     }
@@ -173,11 +210,13 @@ private:
         int cmp_result;
 
         if (type == TYPE_INT) {
-            cmp_result = (*(int *)lhs < *(int *)rhs) ? -1 :
-                         ((*(int *)lhs > *(int *)rhs) ? 1 : 0);
+            int l = *(int *)lhs;
+            int r = *(int *)rhs;
+            cmp_result = (l < r) ? -1 : ((l > r) ? 1 : 0);
         } else if (type == TYPE_FLOAT) {
-            cmp_result = (*(float *)lhs < *(float *)rhs) ? -1 :
-                         ((*(float *)lhs > *(float *)rhs) ? 1 : 0);
+            float l = *(float *)lhs;
+            float r = *(float *)rhs;
+            cmp_result = (l < r) ? -1 : ((l > r) ? 1 : 0);
         } else {
             cmp_result = memcmp(lhs, rhs, len);
         }

@@ -92,11 +92,20 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     bool is_end() const override {
-        return scan_->is_end();
+        return scan_ == nullptr || scan_->is_end();
     }
 
     Rid &rid() override { 
         return rid_; 
+    }
+
+    ColMeta get_col_offset(const TabCol &target) override {
+        for (auto &col : cols_) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                return col;
+            }
+        }
+        throw ColumnNotFoundError(target.col_name);
     }
 
     bool check_conditions(const Rid &rid) {
@@ -121,15 +130,11 @@ class SeqScanExecutor : public AbstractExecutor {
 
         if (cond.is_rhs_val) {
             char *rhs_data = cond.rhs_val.raw->data;
-
             return compare_values(lhs_data, rhs_data, lhs_type, lhs_len, cond.op);
-        }
-
-        else {
+        } else {
             auto rhs_col = get_col_offset(cond.rhs_col);
-
             char *rhs_data = const_cast<char *>(record_data) + rhs_col.offset;
-
+            // 使用左侧类型进行比较（查询优化器保证两侧类型一致）
             return compare_values(lhs_data, rhs_data, lhs_type, lhs_len, cond.op);
         }
     }
@@ -138,18 +143,20 @@ class SeqScanExecutor : public AbstractExecutor {
         int cmp_result;
 
         if (type == TYPE_INT) {
-            cmp_result = (*(int *)lhs < *(int *)rhs) ? -1:
-                         ((*(int *)lhs > *(int *)rhs) ? 1 : 0);
+            int l = *(int *)lhs;
+            int r = *(int *)rhs;
+            cmp_result = (l < r) ? -1 : ((l > r) ? 1 : 0);
         } else if (type == TYPE_FLOAT) {
-            cmp_result = (*(float *)lhs < *(float *)rhs) ? -1 :
-                         ((*(float *)lhs > *(float *)rhs) ? 1 : 0);
+            float l = *(float *)lhs;
+            float r = *(float *)rhs;
+            cmp_result = (l < r) ? -1 : ((l > r) ? 1 : 0);
         } else {
             cmp_result = memcmp(lhs, rhs, len);
         }
 
         switch (op) {
             case OP_EQ: return cmp_result == 0;
-            case OP_NE: return cmp_result !=0;
+            case OP_NE: return cmp_result != 0;
             case OP_LT: return cmp_result < 0;
             case OP_GT: return cmp_result > 0;
             case OP_LE: return cmp_result <= 0;
