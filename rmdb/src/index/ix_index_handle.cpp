@@ -261,15 +261,15 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
         // FIND 路径：shared latch coupling，逐层释放父节点
         root_latch_.lock_shared();
         IxNodeHandle *node = fetch_node(file_hdr_->root_page_);
-        node->page->latch_lock(false);          // shared latch on root
+        node->page->latch_lock(false);         
         root_latch_.unlock_shared();
 
         while (!node->is_leaf_page()) {
             page_id_t child_page_no = find_first ? node->value_at(0) : node->internal_lookup(key);
             IxNodeHandle *child = fetch_node(child_page_no);
-            child->page->latch_lock(false);     // shared latch on child
+            child->page->latch_lock(false);    
 
-            node->page->latch_unlock(false);    // release parent
+            node->page->latch_unlock(false);    
             buffer_pool_manager_->unpin_page(node->get_page_id(), false);
             delete node;
             node = child;
@@ -352,7 +352,6 @@ bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transac
     int pos = leaf_node->lower_bound(key);
     bool found = false;
 
-    // Scan backwards if pos == 0, because previous leaves might also contain the duplicate key
     while (pos == 0 && leaf_node->get_prev_leaf() != INVALID_PAGE_ID && leaf_node->get_prev_leaf() != IX_LEAF_HEADER_PAGE) {
         page_id_t prev_page = leaf_node->get_prev_leaf();
         if (prev_page == leaf_node->get_page_no()) break;

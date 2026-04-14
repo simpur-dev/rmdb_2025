@@ -45,17 +45,116 @@ class SeqScanExecutor : public AbstractExecutor {
         fed_conds_ = conds_;
     }
 
+    size_t tupleLen() const override {
+        return len_;
+    }
+
+    const std::vector<ColMeta> &cols() const
+    override {
+        return cols_;
+    }
+
+    std::string getType() override {
+        return "SeqScanExecutor";
+    }
+
+
     void beginTuple() override {
-        
+        scan_ = std::make_unique<RmScan>(fh_);
+        while (!scan_->is_end()) {
+            if (fed_conds_.empty() || check_conditions(scan_->rid())) {
+                rid_ = scan_->rid();
+                return;
+            }
+            scan_->next();
+        }
     }
 
     void nextTuple() override {
-        
+        scan_->next();
+
+        while (!scan_->is_end()) {
+            if (fed_conds_.empty() || check_conditions(scan_->rid())) {
+                rid_ = scan_->rid();
+                return;
+            }
+            scan_->next();
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (scan_->is_end()) {
+            return nullptr;
+        }
+        rid_ = scan_->rid();
+
+        return fh_->get_record(rid_, context_);
     }
 
-    Rid &rid() override { return rid_; }
+    bool is_end() const override {
+        return scan_->is_end();
+    }
+
+    Rid &rid() override { 
+        return rid_; 
+    }
+
+    bool check_conditions(const Rid &rid) {
+
+        auto record = fh_->get_record(rid, context_);
+
+        for (const auto &cond : fed_conds_) {
+            if (!check_single_condition(record->data, cond)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    bool check_single_condition(const char *record_data, const Condition &cond) {
+        auto lhs_col = get_col_offset(cond.lhs_col);
+
+        char *lhs_data = const_cast<char *>(record_data) + lhs_col.offset;
+
+        ColType lhs_type = lhs_col.type;
+        int lhs_len = lhs_col.len;
+
+        if (cond.is_rhs_val) {
+            char *rhs_data = cond.rhs_val.raw->data;
+
+            return compare_values(lhs_data, rhs_data, lhs_type, lhs_len, cond.op);
+        }
+
+        else {
+            auto rhs_col = get_col_offset(cond.rhs_col);
+
+            char *rhs_data = const_cast<char *>(record_data) + rhs_col.offset;
+
+            return compare_values(lhs_data, rhs_data, lhs_type, lhs_len, cond.op);
+        }
+    }
+
+    bool compare_values(const char *lhs, const char *rhs, ColType type, int len, CompOp op) {
+        int cmp_result;
+
+        if (type == TYPE_INT) {
+            cmp_result = (*(int *)lhs < *(int *)rhs) ? -1:
+                         ((*(int *)lhs > *(int *)rhs) ? 1 : 0);
+        } else if (type == TYPE_FLOAT) {
+            cmp_result = (*(float *)lhs < *(float *)rhs) ? -1 :
+                         ((*(float *)lhs > *(float *)rhs) ? 1 : 0);
+        } else {
+            cmp_result = memcmp(lhs, rhs, len);
+        }
+
+        switch (op) {
+            case OP_EQ: return cmp_result == 0;
+            case OP_NE: return cmp_result !=0;
+            case OP_LT: return cmp_result < 0;
+            case OP_GT: return cmp_result > 0;
+            case OP_LE: return cmp_result <= 0;
+            case OP_GE: return cmp_result >= 0;
+            default: return false;
+        }
+    }
 };
