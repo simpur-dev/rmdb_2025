@@ -51,5 +51,6 @@ test_databases/
 # IDEs
 .vscode/
 .idea/
+.arts/
 *.swp
 *.swo
