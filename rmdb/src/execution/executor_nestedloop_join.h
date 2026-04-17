@@ -24,6 +24,8 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     std::vector<Condition> fed_conds_;          // join条件
     bool isend;
+    std::unique_ptr<RmRecord> left_rec_;        // 当前左表记录缓存
+    std::unique_ptr<RmRecord> right_rec_;       // 当前右表记录缓存
 
     bool check_join_conds(const RmRecord *left_rec, const RmRecord *right_rec) {
         for (auto &cond : fed_conds_) {
@@ -93,61 +95,55 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         fed_conds_ = std::move(conds);
     }
 
+    // 从当前游标位置开始，寻找下一对匹配记录；找不到则置 isend
+    void find_next_match() {
+        while (!isend) {
+            if (!right_->is_end()) {
+                right_rec_ = right_->Next();
+                if (fed_conds_.empty() ||
+                    check_join_conds(left_rec_.get(), right_rec_.get())) {
+                    return;
+                }
+                right_->nextTuple();
+            } else {
+                left_->nextTuple();
+                if (left_->is_end()) {
+                    isend = true;
+                    return;
+                }
+                left_rec_ = left_->Next();
+                right_->beginTuple();
+            }
+        }
+    }
+
     void beginTuple() override {
+        isend = false;
         left_->beginTuple();
         if (left_->is_end()) {
             isend = true;
             return;
         }
+        left_rec_ = left_->Next();
         right_->beginTuple();
-        // 找到第一对满足条件的组合
-        while (!isend) {
-            if (!right_->is_end()) {
-                if (fed_conds_.empty() || check_join_conds(left_->Next().get(), right_->Next().get())) {
-                    return;  // 找到匹配
-                }
-                right_->nextTuple();
-            } else {
-                left_->nextTuple();
-                if (left_->is_end()) {
-                    isend = true;
-                    return;
-                }
-                right_->beginTuple();
-            }
-        }
+        find_next_match();
     }
 
     void nextTuple() override {
+        if (isend) return;
         right_->nextTuple();
-        while (!isend) {
-            if (!right_->is_end()) {
-                if (fed_conds_.empty() || check_join_conds(left_->Next().get(), right_->Next().get())) {
-                    return;
-                }
-                right_->nextTuple();
-            } else {
-                left_->nextTuple();
-                if (left_->is_end()) {
-                    isend = true;
-                    return;
-                }
-                right_->beginTuple();
-            }
-        }
+        find_next_match();
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        if (isend) return nullptr;
-        auto left_rec = left_->Next();
-        auto right_rec = right_->Next();
-        if (!left_rec || !right_rec) return nullptr;
-        // 拼接左右记录
+        if (isend || !left_rec_ || !right_rec_) return nullptr;
         auto joined = std::make_unique<RmRecord>(len_);
-        memcpy(joined->data, left_rec->data, left_->tupleLen());
-        memcpy(joined->data + left_->tupleLen(), right_rec->data, right_->tupleLen());
+        memcpy(joined->data, left_rec_->data, left_->tupleLen());
+        memcpy(joined->data + left_->tupleLen(), right_rec_->data, right_->tupleLen());
         return joined;
     }
+
+    Rid &rid() override { return _abstract_rid; }
 
     bool is_end() const override { return isend; }
     size_t tupleLen() const override { return len_; }

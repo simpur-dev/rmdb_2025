@@ -41,7 +41,8 @@ class UpdateExecutor : public AbstractExecutor {
         for (auto &rid : rids_) {
             auto rec = fh_->get_record(rid, context_);
             for (auto &index : tab_.indexes) {
-                auto ih = sm_manager_->ihs_.at(sm_manager_->get_index_name(tab_name_, index.cols)).get();
+                auto ih = sm_manager_->ihs_.at(
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
                 char *key = new char[index.col_tot_len];
                 int offset = 0;
                 for (int i = 0; i < index.col_num; ++i) {
@@ -53,16 +54,16 @@ class UpdateExecutor : public AbstractExecutor {
                 delete[] key;
             }
 
-            for (auto &clause : set_clones_) {
-                auto col = tab_.get_col(clause.Ihs.col_name);
+            for (auto &clause : set_clauses_) {
+                auto col = tab_.get_col(clause.lhs.col_name);
                 clause.rhs.init_raw(col->len);
-                memcpy(rec->data + col->offset, clause,rhs.raw->data, col->len);
+                memcpy(rec->data + col->offset, clause.rhs.raw->data, col->len);
             }
-            fh_->updata_record(rid, rec->data, context_);
+            fh_->update_record(rid, rec->data, context_);
 
             for (auto &index : tab_.indexes) {
                 auto ih = sm_manager_->ihs_.at(
-                    sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+                    sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
 
                     char *key = new char[index.col_tot_len];
                     int offset = 0;

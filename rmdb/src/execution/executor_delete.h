@@ -42,7 +42,7 @@ class DeleteExecutor : public AbstractExecutor {
             for (auto &index : tab_.indexes) {
                 auto ih = sm_manager_->ihs_.at(
                     sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                char *key = new char[index.col_tol_len];
+                char *key = new char[index.col_tot_len];
                 int offset = 0;
                 for (int i = 0; i < index.col_num; ++i) {
                     memcpy(key + offset, rec->data + index.cols[i].offset, index.cols[i].len);
