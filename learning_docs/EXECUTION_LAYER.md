@@ -412,16 +412,34 @@ Executor 树（同构）:
 
 ## 七、当前状态与待办
 
-| 算子 | 状态 |
-|---|---|
-| `SeqScanExecutor` | ✅ 完成 + 测试 |
-| `IndexScanExecutor` | ✅ 完成 + 测试 |
-| `InsertExecutor` | ✅ 完成 |
-| `DeleteExecutor` | ✅ 完成 |
-| `UpdateExecutor` | ✅ 完成 |
-| `NestedLoopJoinExecutor` | ✅ 完成 |
-| `ProjectionExecutor` | ❌ 空壳待实现 |
-| `SortExecutor` | ❌ 空壳待实现 |
+### 7.1 算子完成度
+
+| 算子 | 状态 | 测试 | 备注 |
+|---|---|---|---|
+| `SeqScanExecutor` | ✅ | 🧪 19 | 条件过滤、大数据、元信息 |
+| `IndexScanExecutor` | ✅ | 🧪 19 | 范围/等值/点查、边界 |
+| `InsertExecutor` | ✅ | 🧪 5 | 含索引同步、列数/类型校验 |
+| `DeleteExecutor` | ✅ | 🧪 5 | 空 rids、选择性删除、索引维护 |
+| `UpdateExecutor` | ✅ | 🧪 3 | 修复 init_raw 重复调用 bug |
+| `NestedLoopJoinExecutor` | ✅ | 🧪 8 | 双空、笛卡尔积、重复键 |
+| `ProjectionExecutor` | ✅ | 🧪 6 | 列重排、大数据、元信息 |
+| `SortExecutor` | ✅ | 🧪 8 | 升降序、非首列、重复值 |
+
+### 7.2 已修复的 Bug
+
+| 位置 | Bug | 修复 |
+|---|---|---|
+| `UpdateExecutor::Next()` | `clause.rhs.init_raw()` 在 `rids_` 循环内重复调用，第二次 `raw != nullptr` 触发 assert | 加 `if (!clause.rhs.raw)` 守卫 |
+
+### 7.3 测试文件
+
+| 文件 | 测试数 | 覆盖范围 |
+|---|---|---|
+| `executor_scan_test.cpp` | 19 | SeqScan + IndexScan |
+| `executor_full_test.cpp` | 40 | 全部 8 个执行器 + 组合流水线 |
+| `integration_test.cpp` | 26 | 三层联动（Storage→BufferPool→Record/Index→Execution） |
+
+### 7.4 待办
 
 `execution_common.h` 声明的 MVCC 函数（`ReconstructTuple` / `IsWriteWriteConflict`）是为 MVCC 事务保留的接口，当前未实现，也未被任何算子使用。
 
