@@ -248,7 +248,45 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    TabMeta &tab = db_.get_table(tab_name);
+    if (tab.is_index(col_names)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+
+    std::vector<ColMeta> index_cols;
+    for (auto &col_name : col_names) {
+        index_cols.push_back(*tab.get_col(col_name));
+    }
+
+    ix_manager_->create_index(tab_name, index_cols);
+    auto ix_name = ix_manager_->get_index_name(tab_name, index_cols);
+    ihs_.emplace(ix_name, ix_manager_->open_index(tab_name, index_cols));
+    auto *ih = ihs_.at(ix_name).get();
+    auto *fh = fhs_.at(tab_name).get();
+    int tot_len = 0;
+    for (auto &col : index_cols) tot_len += col.len;
+    for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+        auto rec = fh->get_record(scan.rid(), nullptr);
+        char *key = new char[tot_len];
+        int offset = 0;
+        for (size_t i = 0; i < index_cols.size(); ++i) {
+            //把表中某一列的二进制数据，拷贝到索引键里，拼接成完整的索引键
+            memcpy(key + offset, rec->data + index_cols[i].offset, index_cols[i].len);
+            offset += index_cols[i].len;
+        }
+        ih->insert_entry(key, scan.rid(), nullptr);
+        delete[] key;
+    }
+    IndexMeta idx_meta;
+    idx_meta.tab_name = tab_name;
+    idx_meta.col_num = index_cols.size();
+    idx_meta.col_tot_len = tot_len;
+    idx_meta.cols = index_cols;
+    tab.indexes.push_back(idx_meta);
+    flush_meta();
 }
 
 /**
@@ -258,7 +296,18 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    TabMeta &tab = db_.get_table(tab_name);
+    auto ix_name = ix_manager_->get_index_name(tab_name, col_names);
+    //关闭并销毁索引文件
+    ix_manager_->close_index(ihs_.at(ix_name).get());
+    ihs_.erase(ix_name);
+    ix_manager_->destroy_index(tab_name, col_names);
+    auto idx_it = tab.get_index_meta(col_names);
+    tab.indexes.erase(idx_it);
+    flush_meta();
 }
 
 /**
@@ -268,5 +317,9 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
-    
+    std::vector<std::string> col_names;
+    for (auto &col : cols) {
+        col_names.push_back(col.name);
+    }
+    drop_index(tab_name, col_names, context);
 }
