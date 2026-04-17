@@ -268,6 +268,10 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     auto *fh = fhs_.at(tab_name).get();
     int tot_len = 0;
     for (auto &col : index_cols) tot_len += col.len;
+    // 回填时需要一个 Transaction 供索引 crabbing 协议使用
+    // 若 context 为空则使用临时事务
+    Transaction tmp_txn(0);
+    Transaction *backfill_txn = (context != nullptr) ? context->txn_ : &tmp_txn;
     for (RmScan scan(fh); !scan.is_end(); scan.next()) {
         auto rec = fh->get_record(scan.rid(), nullptr);
         char *key = new char[tot_len];
@@ -277,7 +281,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
             memcpy(key + offset, rec->data + index_cols[i].offset, index_cols[i].len);
             offset += index_cols[i].len;
         }
-        ih->insert_entry(key, scan.rid(), nullptr);
+        ih->insert_entry(key, scan.rid(), backfill_txn);
         delete[] key;
     }
     IndexMeta idx_meta;

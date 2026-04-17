@@ -12,3 +12,6 @@ target_link_libraries(executor_full_test storage lru_replacer record index syste
 
 add_executable(integration_test integration_test/integration_test.cpp)
 target_link_libraries(integration_test storage lru_replacer record index system transaction execution gtest_main)
+
+add_executable(sm_manager_test system_test/sm_manager_test.cpp)
+target_link_libraries(sm_manager_test storage lru_replacer record index system transaction execution gtest_main)
