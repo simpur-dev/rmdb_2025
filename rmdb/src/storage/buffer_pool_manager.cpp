@@ -196,12 +196,10 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     frame_id_t frame_id = it->second;
     Page* page = &pages_[frame_id];
 
-    // 2. 只有脏页才需要写回磁盘(优化性能)
-    if (page->is_dirty_) {
-        disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
-        // 3. 清除脏页标记
-        page->is_dirty_ = false;
-    }
+    // 2. 无论是否为脏页，都写回磁盘
+    disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    // 3. 清除脏页标记
+    page->is_dirty_ = false;
 
     return true;
 }
@@ -279,8 +277,8 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 从页表中删除
     page_table_.erase(page_id);
 
-    // 从 replacer 中移除(让页面可以被淘汰)
-    replacer_->unpin(frame_id);
+    // 从 replacer 中移除（pin_count==0 时帧在 replacer 中，需要摘出）
+    replacer_->pin(frame_id);
 
     // 重置页面元数据
     page->reset_memory();

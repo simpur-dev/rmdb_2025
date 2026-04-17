@@ -6,3 +6,9 @@ target_link_libraries(record_index_deep_test storage lru_replacer record index s
 
 add_executable(executor_scan_test executor_test/executor_scan_test.cpp)
 target_link_libraries(executor_scan_test storage lru_replacer record index system transaction execution gtest_main)
+
+add_executable(executor_full_test executor_test/executor_full_test.cpp)
+target_link_libraries(executor_full_test storage lru_replacer record index system transaction execution gtest_main)
+
+add_executable(integration_test integration_test/integration_test.cpp)
+target_link_libraries(integration_test storage lru_replacer record index system transaction execution gtest_main)

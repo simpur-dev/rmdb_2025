@@ -56,7 +56,9 @@ class UpdateExecutor : public AbstractExecutor {
 
             for (auto &clause : set_clauses_) {
                 auto col = tab_.get_col(clause.lhs.col_name);
-                clause.rhs.init_raw(col->len);
+                if (!clause.rhs.raw) {
+                    clause.rhs.init_raw(col->len);
+                }
                 memcpy(rec->data + col->offset, clause.rhs.raw->data, col->len);
             }
             fh_->update_record(rid, rec->data, context_);
