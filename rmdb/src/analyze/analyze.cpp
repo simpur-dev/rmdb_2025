@@ -53,6 +53,9 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_clause(query->tables, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
         /** TODO: */
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
         query->tables = {x->tab_name};
         TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);
         for (auto &sv_sc : x ->set_clauses) {
@@ -74,12 +77,45 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
         //处理where条件
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        query->tables = {x->tab_name};
         get_clause(x->conds, query->conds);
         check_clause({x->tab_name}, query->conds);        
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
-        // 处理insert 的values值
-        for (auto &sv_val : x->vals) {
-            query->values.push_back(convert_sv_value(sv_val));
+        //重写InsertStmt完整校验
+        //在analyze阶段就把“数量、类型、表存在性”查清楚，顺便做INT->FLOAT隐式提升
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        query->tables = {x->tab_name};
+
+        TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);
+
+        if (x->vals.size() != tab.cols.size()) {
+            throw InternalError("INSERT values count does not match column count");
+        }
+
+        query->values.reserve(x->vals.size());
+
+        for (size_t i = 0; i < x->vals.size(); ++i) {
+            Value val = convert_sv_value(x->vals[i]);
+            const ColMeta &col = tab.cols[i];
+
+            if (col.type == TYPE_FLOAT && val.type == TYPE_INT) {
+                val.set_float((float)val.int_val);
+            }
+
+            if (col.type != val.type) {
+                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(val.type));
+            }
+
+            if (col.type == TYPE_STRING && (int)val.str_val.size() > col.len) {
+                throw StringOverflowError();
+            }
+
+            query->values.push_back(std::move(val));
         }
     } else {
         // do nothing
@@ -107,7 +143,10 @@ TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target
         target.tab_name = tab_name;
     } else {
         /** TODO: Make sure target column exists */
-        
+        auto it = std::find_if(all_cols.begin(), all_cols.end(), [&](const ColMeta &c) {
+            return c.tab_name == target.tab_name && c.name == target.col_name;
+        });
+        if (it == all_cols.end()) throw ColumnNotFoundError(target.col_name);
     }
     return target;
 }
