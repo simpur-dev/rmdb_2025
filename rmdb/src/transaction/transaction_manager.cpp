@@ -27,8 +27,17 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     // 3. 把开始事务加入到全局事务表中
     // 4. 返回当前事务指针
     // 如果需要支持MVCC请在上述过程中添加代码
-    
-    return nullptr;
+    if (txn == nullptr) {
+        txn_id_t new_id = next_txn_id_.fetch_add(1);
+        txn = new Transaction(new_id);
+        txn->set_start_ts(next_timestamp_.fetch_add(1));
+    }
+    {
+        std::unique_lock<std::mutex> lock(latch_);
+        txn_map[txn->get_transaction_id()] = txn;
+    }
+    txn->set_state(TransactionState::GROWING);
+    return txn;
 }
 
 /**
@@ -44,7 +53,20 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // 4. 把事务日志刷入磁盘中
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
+    if (txn == nullptr) return;
+    auto lock_set = txn->get_lock_set();
 
+    if (lock_set) {
+        for (auto &lock_id : *lock_set) {
+            lock_manager_->unlock(txn, lock_id);
+        }
+        lock_set->clear();
+    }
+    txn->get_write_set()->clear();
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
+    txn->set_state(TransactionState::COMMITTED);
 }
 
 /**
@@ -60,5 +82,20 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     // 4. 把事务日志刷入磁盘中
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
+    if (txn == nullptr) return;
+    //先简化实现， 后续补WriteRecord反向重放
+    txn->get_write_set()->clear();
+
+    auto lock_set = txn->get_lock_set();
+    if (lock_set) {
+        for (auto &lock_id : *lock_set) {
+            lock_manager_->unlock(txn, lock_id);
+        }
+        lock_set->clear();
+    }
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
+    txn->set_state(TransactionState::ABORTED);
     
 }
