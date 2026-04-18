@@ -23,7 +23,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 处理表名
         query->tables = std::move(x->tabs);
         /** TODO: 检查表是否存在 */
-
+        for (auto &tab_name : query->tables) {
+            if (!sm_manager_->db_.is_table(tab_name)) {
+                throw TableNotFoundError(tab_name);
+            }
+        }
         // 处理target list，再target list中添加上表名，例如 a.id
         for (auto &sv_sel_col : x->cols) {
             TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
@@ -49,6 +53,24 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_clause(query->tables, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
         /** TODO: */
+        query->tables = {x->tab_name};
+        TabMeta &tab = sm_manager_->db_.get_table(x->tab_name);
+        for (auto &sv_sc : x ->set_clauses) {
+            SetClause sc;
+            sc.lhs = {.tab_name = x->tab_name, .col_name = sv_sc->col_name};
+            sc.rhs = convert_sv_value(sv_sc->val);
+            auto col = tab.get_col(sv_sc->col_name);
+            if (col->type == TYPE_FLOAT && sc.rhs.type == TYPE_INT) {
+                sc.rhs.set_float((float)sc.rhs.int_val);
+            } 
+            if (col->type != sc.rhs.type) {
+                throw IncompatibleTypeError(coltype2str(col->type), coltype2str(sc.rhs.type));
+            }
+            query->set_clauses.push_back(sc);
+        }
+        
+        get_clause(x->conds, query->conds);
+        check_clause({x->tab_name}, query->conds);
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
         //处理where条件
@@ -131,8 +153,11 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
         if (cond.is_rhs_val) {
+            if (lhs_type == TYPE_FLOAT && cond.rhs_val.type == TYPE_INT) {
+                cond.rhs_val.set_float((float)cond.rhs_val.int_val);
+            }
             cond.rhs_val.init_raw(lhs_col->len);
-            rhs_type = cond.rhs_val.type;
+            rhs_type = cond.rhs_val.type;       
         } else {
             TabMeta &rhs_tab = sm_manager_->db_.get_table(cond.rhs_col.tab_name);
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
