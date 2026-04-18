@@ -77,11 +77,17 @@ class InvalidColLengthError : public RMDBError {
     InvalidColLengthError(int col_len) : RMDBError("Invalid column length: " + std::to_string(col_len)) {}
 };
 
+//B+树里查不到期望的 key，抛错
 class IndexEntryNotFoundError : public RMDBError {
    public:
     IndexEntryNotFoundError() : RMDBError("Index entry not found") {}
 };
 
+//B+树里面已经有相同key，不允许再插，抛错
+class IndexEntryDuplicateError : public RMDBError {
+    public:
+    IndexEntryDuplicateError() : RMDBError("Duplicate key violates unique index") {}
+};
 // SM errors
 class DatabaseNotFoundError : public RMDBError {
    public:
