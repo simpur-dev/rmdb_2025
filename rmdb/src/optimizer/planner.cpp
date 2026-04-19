@@ -22,15 +22,50 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
-// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
+// 索引匹配规则：
+//   多列索引 → 所有索引列都必须出现在 OP_EQ 条件中
+//   单列索引 → 索引列出现在任意比较条件中即可
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
     index_col_names.clear();
-    for(auto& cond: curr_conds) {
-        if(cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name.compare(tab_name) == 0)
-            index_col_names.push_back(cond.lhs_col.col_name);
+    // 收集 EQ 列（去重）和 任意条件列（去重）
+    std::vector<std::string> eq_cols;
+    std::vector<std::string> any_cols;
+    for (auto& cond : curr_conds) {
+        if (!cond.is_rhs_val || cond.lhs_col.tab_name.compare(tab_name) != 0) continue;
+        if (std::find(any_cols.begin(), any_cols.end(), cond.lhs_col.col_name) == any_cols.end()) {
+            any_cols.push_back(cond.lhs_col.col_name);
+        }
+        if (cond.op == OP_EQ &&
+            std::find(eq_cols.begin(), eq_cols.end(), cond.lhs_col.col_name) == eq_cols.end()) {
+            eq_cols.push_back(cond.lhs_col.col_name);
+        }
     }
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
-    if(tab.is_index(index_col_names)) return true;
+    // 策略1：多列索引，所有列都有 EQ 条件
+    for (auto& index : tab.indexes) {
+        if (index.col_num <= 1) continue;
+        bool all_eq = true;
+        std::vector<std::string> idx_col_names;
+        for (size_t i = 0; i < static_cast<size_t>(index.col_num); ++i) {
+            if (std::find(eq_cols.begin(), eq_cols.end(), index.cols[i].name) == eq_cols.end()) {
+                all_eq = false;
+                break;
+            }
+            idx_col_names.push_back(index.cols[i].name);
+        }
+        if (all_eq) {
+            index_col_names = idx_col_names;
+            return true;
+        }
+    }
+    // 策略2：单列索引，列出现在任意条件中
+    for (auto& index : tab.indexes) {
+        if (index.col_num != 1) continue;
+        if (std::find(any_cols.begin(), any_cols.end(), index.cols[0].name) != any_cols.end()) {
+            index_col_names = {index.cols[0].name};
+            return true;
+        }
+    }
     return false;
 }
 
