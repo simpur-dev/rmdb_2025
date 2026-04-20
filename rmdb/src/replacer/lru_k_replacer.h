@@ -27,4 +27,10 @@ private:
     std::mutex latch_;
     size_t max_size_;
     size_t k_;
+
+    std::list<frame_id_t> history_list_;
+    std::unorded_map<frame_id_t, std::list<frame_id_t>::iterator> history_hash_;
+
+    std::list<frame_id_t> cache_list_;
+    
 }

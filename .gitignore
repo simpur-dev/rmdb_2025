@@ -54,3 +54,9 @@ test_databases/
 .arts/
 *.swp
 *.swo
+
+# MySQL source code (reference only)
+mysql/
+
+# Competition reference code
+mt/
