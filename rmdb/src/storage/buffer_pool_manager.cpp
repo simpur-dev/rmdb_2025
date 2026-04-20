@@ -46,7 +46,11 @@ void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t n
 
     // 如果是脏页,写回磁盘
     if (page->is_dirty_) {
+        auto _wr_t0 = std::chrono::steady_clock::now();
         disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
+        stats_.disk_write_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - _wr_t0).count();
+        stats_.disk_write_count++;
         page->is_dirty_ = false;
     }
 
@@ -84,7 +88,9 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
     // 4.     固定目标页，更新pin_count_
     // 5.     返回目标页
 
+    BPM_TIMER_START;
     std::scoped_lock lock{latch_};
+    stats_.fetch_count++;
 
     // 1. 查找页表,检查页面是否已在缓冲池中
     auto it = page_table_.find(page_id);
@@ -94,27 +100,43 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
         Page* page = &pages_[frame_id];
         page->pin_count_++;
         replacer_->pin(frame_id);
+        stats_.hit_count++;
+        stats_.fetch_total_ns += BPM_TIMER_NS;
         return page;
     }
+
+    stats_.miss_count++;
 
     // 1.2 页面不在缓冲池中,需要从磁盘加载
     frame_id_t frame_id;
     if (!find_victim_page(&frame_id)) {
         // 没有可用的 frame
+        stats_.fetch_total_ns += BPM_TIMER_NS;
         return nullptr;
     }
 
     // 2. 获取 victim page 并更新
     Page* page = &pages_[frame_id];
+    stats_.evict_count++;
+    if (page->is_dirty_) {
+        stats_.evict_dirty_count++;
+    }
     update_page(page, page_id, frame_id);
 
     // 3. 从磁盘读取页面数据
-    disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    {
+        auto _rd_t0 = std::chrono::steady_clock::now();
+        disk_manager_->read_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+        stats_.disk_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - _rd_t0).count();
+        stats_.disk_read_count++;
+    }
 
     // 4. 固定页面
     page->pin_count_ = 1;
     replacer_->pin(frame_id);
 
+    stats_.fetch_total_ns += BPM_TIMER_NS;
     // 5. 返回页面
     return page;
 }
@@ -137,6 +159,7 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     // 3 根据参数is_dirty，更改P的is_dirty_
 
     std::scoped_lock lock{latch_};
+    stats_.unpin_count++;
 
     // 1. 查找页表
     auto it = page_table_.find(page_id);
@@ -184,6 +207,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     // 3. 更新P的is_dirty_
 
     std::scoped_lock lock{latch_};
+    stats_.flush_count++;
 
     // 1. 查找页表
     auto it = page_table_.find(page_id);
@@ -197,7 +221,13 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     Page* page = &pages_[frame_id];
 
     // 2. 无论是否为脏页，都写回磁盘
-    disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    {
+        auto _wr_t0 = std::chrono::steady_clock::now();
+        disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+        stats_.disk_write_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - _wr_t0).count();
+        stats_.disk_write_count++;
+    }
     // 3. 清除脏页标记
     page->is_dirty_ = false;
 
@@ -217,6 +247,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     // 5.   返回获得的page
 
     std::scoped_lock lock{latch_};
+    stats_.new_page_count++;
 
     // 1. 获取一个可用的 frame
     frame_id_t frame_id;
@@ -304,7 +335,11 @@ void BufferPoolManager::flush_all_pages(int fd) {
         if (page_id.fd == fd) {
             Page* page = &pages_[frame_id];
             if (page->is_dirty_) {
+                auto _wr_t0 = std::chrono::steady_clock::now();
                 disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+                stats_.disk_write_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - _wr_t0).count();
+                stats_.disk_write_count++;
                 page->is_dirty_ = false;
             }
         }

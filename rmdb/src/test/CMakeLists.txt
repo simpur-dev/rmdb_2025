@@ -15,3 +15,6 @@ target_link_libraries(integration_test storage lru_replacer record index system 
 
 add_executable(sm_manager_test system_test/sm_manager_test.cpp)
 target_link_libraries(sm_manager_test storage lru_replacer record index system transaction execution gtest_main)
+
+add_executable(bpm_bench buffer_pool_benchmark.cpp)
+target_link_libraries(bpm_bench storage lru_replacer pthread)

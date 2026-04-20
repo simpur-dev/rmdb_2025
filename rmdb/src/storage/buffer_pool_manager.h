@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <vector>
 
+#include "bpm_stats.h"
 #include "disk_manager.h"
 #include "errors.h"
 #include "page.h"
@@ -32,6 +33,7 @@ class BufferPoolManager {
     DiskManager *disk_manager_;
     Replacer *replacer_;    // buffer_pool的置换策略，当前赛题中为LRU置换策略
     std::mutex latch_;      // 用于共享数据结构的并发控制
+    BpmStats stats_;         // 性能统计（原子计数，无需额外加锁）
 
    public:
     BufferPoolManager(size_t pool_size, DiskManager *disk_manager)
@@ -75,6 +77,9 @@ class BufferPoolManager {
     bool delete_page(PageId page_id);
 
     void flush_all_pages(int fd);
+
+    BpmStats& get_stats() { return stats_; }
+    const BpmStats& get_stats() const { return stats_; }
 
    private:
     bool find_victim_page(frame_id_t* frame_id);
