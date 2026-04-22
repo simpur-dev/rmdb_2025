@@ -236,51 +236,29 @@ static BenchResult bench_concurrent(DiskManager* dm, int fd, size_t pool_size,
 
 // ─── Main ───
 
-int main() {
-    // 参数
-    const size_t POOL_SIZE = 256;       // 缓冲池大小（帧数）
-    const size_t TOTAL_PAGES = 4096;    // 磁盘上总页数
-    const size_t READ_OPS = 50000;      // 读操作次数
-    const size_t DIRTY_OPS = 50000;     // 脏页压力操作次数
-    const size_t CONC_OPS = 10000;      // 每线程操作次数
-    const int THREADS = 4;              // 并发线程数
-
+static void run_suite(DiskManager* dm, int fd, size_t pool_size, size_t total_pages,
+                      size_t read_ops, size_t dirty_ops, size_t conc_ops, int threads) {
     printf("╔═══════════════════════════════════════════╗\n");
     printf("║     Buffer Pool Manager Benchmark         ║\n");
     printf("╠═══════════════════════════════════════════╣\n");
-    printf("║  pool_size   = %5zu frames                ║\n", POOL_SIZE);
-    printf("║  total_pages = %5zu (on disk)             ║\n", TOTAL_PAGES);
+    printf("║  pool_size   = %5zu frames                ║\n", pool_size);
+    printf("║  total_pages = %5zu (on disk)             ║\n", total_pages);
     printf("║  page_size   = %5d bytes                 ║\n", PAGE_SIZE);
-    printf("║  threads     = %5d                       ║\n", THREADS);
+    printf("║  threads     = %5d                       ║\n", threads);
     printf("╚═══════════════════════════════════════════╝\n\n");
-
-    BenchEnv env;
-    env.setup();
 
     std::vector<BenchResult> results;
 
-    // 1. 顺序写入（也为后续 bench 准备磁盘数据）
-    results.push_back(bench_sequential_write(env.dm.get(), env.fd, POOL_SIZE, TOTAL_PAGES));
+    results.push_back(bench_sequential_write(dm, fd, pool_size, total_pages));
+    results.push_back(bench_sequential_read(dm, fd, pool_size, total_pages));
+    results.push_back(bench_random_read(dm, fd, pool_size, total_pages, read_ops));
+    results.push_back(bench_hotspot_read(dm, fd, pool_size, total_pages, read_ops));
+    results.push_back(bench_dirty_eviction(dm, fd, pool_size, total_pages, dirty_ops));
+    results.push_back(bench_concurrent(dm, fd, pool_size, total_pages, conc_ops, threads));
 
-    // 2. 顺序读取
-    results.push_back(bench_sequential_read(env.dm.get(), env.fd, POOL_SIZE, TOTAL_PAGES));
-
-    // 3. 随机读取
-    results.push_back(bench_random_read(env.dm.get(), env.fd, POOL_SIZE, TOTAL_PAGES, READ_OPS));
-
-    // 4. 热点读取
-    results.push_back(bench_hotspot_read(env.dm.get(), env.fd, POOL_SIZE, TOTAL_PAGES, READ_OPS));
-
-    // 5. 脏页淘汰
-    results.push_back(bench_dirty_eviction(env.dm.get(), env.fd, POOL_SIZE, TOTAL_PAGES, DIRTY_OPS));
-
-    // 6. 多线程
-    results.push_back(bench_concurrent(env.dm.get(), env.fd, POOL_SIZE, TOTAL_PAGES, CONC_OPS, THREADS));
-
-    // ─── 汇总 ───
-    printf("\n\n");
+    printf("\n");
     printf("╔═══════════════════════════════════════════════════════════════════╗\n");
-    printf("║                       SUMMARY                                   ║\n");
+    printf("║                       SUMMARY (pool=%zu)                       ║\n", pool_size);
     printf("╠══════════════════════╦════════╦════════════╦══════════╦══════════╣\n");
     printf("║ Benchmark            ║ ops    ║ throughput ║ hit%%     ║ avg(us)  ║\n");
     printf("╠══════════════════════╬════════╬════════════╬══════════╬══════════╣\n");
@@ -293,10 +271,28 @@ int main() {
     }
     printf("╚══════════════════════╩════════╩════════════╩══════════╩══════════╝\n");
 
-    // 详细信息
     for (auto& r : results) {
         print_result(r);
     }
+}
+
+int main() {
+    const size_t TOTAL_PAGES = 4096;
+    const size_t READ_OPS = 50000;
+    const size_t DIRTY_OPS = 50000;
+    const size_t CONC_OPS = 10000;
+    const int THREADS = 4;
+
+    BenchEnv env;
+    env.setup();
+
+    // ─── 小池子：256 帧 (6.25% 覆盖率) ───
+    printf("\n==================== 小池子 ====================\n\n");
+    run_suite(env.dm.get(), env.fd, 256, TOTAL_PAGES, READ_OPS, DIRTY_OPS, CONC_OPS, THREADS);
+
+    // ─── 大池子：4096 帧 (100% 覆盖率) ───
+    printf("\n\n==================== 大池子 ====================\n\n");
+    run_suite(env.dm.get(), env.fd, 4096, TOTAL_PAGES, READ_OPS, DIRTY_OPS, CONC_OPS, THREADS);
 
     env.teardown();
     return 0;
