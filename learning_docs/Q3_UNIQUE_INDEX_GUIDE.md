@@ -1,7 +1,7 @@
 # 题目三复习文档 — 唯一索引
 
 > 持续更新。每完成一个 Step，就在对应章节加内容。
-> 目前进度：**Step 1 + Step 2 已完成**；Step 3/4/5 待做。
+> 目前进度：**全部 5 个 Step 已完成**，106 个单元测试通过。
 
 ---
 
@@ -12,7 +12,7 @@
 | 子功能 | 说明 |
 |---|---|
 | `create index / drop index` | 框架已提供（`SmManager::create_index / drop_index`） |
-| `show index from t` | **未实现** → Step 5 |
+| `show index from t` | ✅ Step 5 已实现 |
 | 索引加速查询 | `IndexScanExecutor` 已提供；可能需要优化器进一步选索引 |
 | **唯一性约束** | **核心要求**：重复 key 时服务端输出 `failure`，表/索引不能损坏 |
 | 失败处理 | 冲突发生后，服务端继续正常运行（不崩） |
@@ -38,9 +38,10 @@ select * from t;              -- 只能有 (1,'a') (2,'c')
 |---|---|:---:|---|
 | 1 | 新增 `IndexEntryDuplicateError` 异常 | ✅ | `errors.h` |
 | 2 | `InsertExecutor` 唯一性 pre-check | ✅ | `executor_insert.h` |
-| 3 | `UpdateExecutor` 唯一性 pre-check（含自身豁免） | ⏳ | `executor_update.h` |
-| 4 | 回归验证：DDL + DML + Index 混合场景 | ⏳ | 端到端 SQL 脚本 |
-| 5 | `SHOW INDEX` 全链路实现 | ⏳ | parser / ast / analyze / executor / plan |
+| 3 | `UpdateExecutor` 唯一性 pre-check（含自身豁免） | ✅ | `executor_update.h` |
+| 4 | 回归验证：DDL + DML + Index 混合场景 | ✅ | 106 个单元测试全过 |
+| 5 | `SHOW INDEX` 全链路实现 | ✅ | ast.h / yacc.y / plan.h / optimizer.h / execution_manager.cpp / sm_manager.h/.cpp |
+| 6 | `TabMeta` 拷贝构造函数 bug 修复 | ✅ | `sm_meta.h` |
 
 ---
 
@@ -192,12 +193,15 @@ select * from t;                # 只有 (1,'a') (2,'c')
 
 ---
 
-## 五、Step 3 待做 — `UpdateExecutor` 改造
+## 五、Step 3 已完成 — `UpdateExecutor` 改造
+
+### 修改位置
+`@/home/simpur/rmdb_2025/db2025/rmdb/src/execution/executor_update.h`
 
 ### 为什么 Update 比 Insert 难
 
-Insert 是"无中生有"，查到已有 key 就是冲突。
-Update 是"在已有行上修改"，有个关键例外：**新 key 本来就是自己的 → 不算冲突**。
+Insert 是“无中生有”，查到已有 key 就是冲突。
+Update 是“在已有行上修改”，有个关键例外：**新 key 本来就是自己的 → 不算冲突**。
 
 ### 场景示例
 
@@ -210,56 +214,214 @@ update t set val = 99 where id = 5;
 -- 但 rid=X 正是当前这一行！不能算冲突
 ```
 
-### 设计思路（Step 3 实施时再细化）
+### 实际实现流程
 
 ```
 for 每个 rid 要更新:
-    读 old_rec
-    构造 new_rec (按 set_clauses 覆盖)
-
-    for 每个索引:
-        算 old_key (从 old_rec)
-        算 new_key (从 new_rec)
-
-        if old_key == new_key:
-            skip         ← 值没变，索引不动
-        else:
-            get_value(new_key):
-                若查到的 rid 不是当前这行 → 冲突，throw
-                若没查到 → OK
-            标记：这个索引需要 delete old_key + insert new_key
-
-    pre-check 全过 → 执行所有标记的 delete + update_record + insert
+  ① 读 old_rec
+  ② 拷贝出 new_rec，应用 set_clauses
+  ③ Pre-check 阶段（零副作用）：
+      for 每个索引:
+          算 old_key / new_key
+          if memcmp(old_key, new_key) == 0:
+              标记 key_changed[i] = false，跳过
+          else:
+              key_changed[i] = true
+              get_value(new_key) → 查到的 rid 列表
+              遍历结果，排除自身 rid → 若仍有其他匹配 → throw 冲突
+  ④ Commit 阶段（前面全过才做）：
+      for 每个 key_changed 的索引:
+          delete_entry(old_key)
+      update_record(rid, new_rec)
+      for 每个 key_changed 的索引:
+          insert_entry(new_key, rid)
 ```
 
-**简化策略**（先写最稳版）：
-- 一次 update 只处理一行（按 rids_ 逐行 pre-check → 写入）
-- 多行原子性：题目三测试不强制，后续 WAL/恢复阶段再补
+### 代码要点
+
+```cpp
+std::unique_ptr<RmRecord> Next() override {
+    for (auto &rid : rids_) {
+        auto rec = fh_->get_record(rid, context_);
+        // 构造 new_rec
+        RmRecord new_rec(fh_->get_file_hdr().record_size);
+        memcpy(new_rec.data, rec->data, rec->size);
+        for (auto &clause : set_clauses_) { ... }
+
+        // Pre-check
+        size_t n_idx = tab_.indexes.size();
+        std::vector<std::unique_ptr<char[]>> old_keys(n_idx), new_keys(n_idx);
+        std::vector<bool> key_changed(n_idx, false);
+
+        for (size_t i = 0; i < n_idx; ++i) {
+            // 算 old_key / new_key
+            if (memcmp(old_keys[i].get(), new_keys[i].get(), len) == 0)
+                continue;  // key 没变，跳过
+            key_changed[i] = true;
+            // get_value 查重，排除自身 rid
+            for (auto &out_rid : out) {
+                if (out_rid != rid) throw IndexEntryDuplicateError();
+            }
+        }
+
+        // Commit：先删旧 key，再改记录，再插新 key
+        for (size_t i = 0; i < n_idx; ++i) {
+            if (!key_changed[i]) continue;
+            ih->delete_entry(old_keys[i].get(), ...);
+        }
+        fh_->update_record(rid, new_rec.data, context_);
+        for (size_t i = 0; i < n_idx; ++i) {
+            if (!key_changed[i]) continue;
+            ih->insert_entry(new_keys[i].get(), rid, ...);
+        }
+    }
+    return nullptr;
+}
+```
+
+### 三个关键设计决策
+
+#### 决策 1：为什么需要“自身豁免”
+`update t set val = 99 where id = 5;` — id 没变，`get_value(5)` 会查到自己。如果不排除自身 rid，就会误报冲突。
+
+#### 决策 2：为什么用 `memcmp` 跳过未变的索引
+如果 key 没变，delete + insert 是无用功，还可能因为并发引起竞态。`memcmp == 0` 直接跳过，**既高效又安全**。
+
+#### 决策 3：为什么 delete → update_record → insert 三步分离
+不能先 insert 新 key（可能和旧 key 冲突），也不能先删记录（索引还指向旧位置）。**delete 旧 key → 改记录 → insert 新 key** 是唯一安全顺序。
 
 ---
 
-## 六、Step 5 预告 — `SHOW INDEX`
+## 六、Step 5 已完成 — `SHOW INDEX` 全链路
 
-需要改的 6 层：
+### 涉及文件（6 层修改）
 
-1. **Lexer / Parser** `rmdb/src/parser/lex.l`, `yacc.y` — 识别 `SHOW INDEX FROM t`
-2. **AST** `parser/ast.h` — 新节点 `ShowIndex`
-3. **Analyze** `analyze/analyze.cpp` — `ShowIndex` 分支，校验表存在
-4. **Plan** 新 plan 节点或复用 OtherPlan
-5. **Executor** 新 `ShowIndexExecutor`，从 `TabMeta.indexes` 取数据格式化输出
-6. **Interp** `execution_manager.cpp` 把 plan 派发到 executor
+| 层 | 文件 | 修改内容 |
+|---|---|---|
+| AST | `@/home/simpur/rmdb_2025/db2025/rmdb/src/parser/ast.h:50-53` | 新增 `ShowIndex` 节点 |
+| Parser | `@/home/simpur/rmdb_2025/db2025/rmdb/src/parser/yacc.y:112-115` | 新增 `SHOW INDEX FROM tbName` 语法规则 |
+| Plan | `@/home/simpur/rmdb_2025/db2025/rmdb/src/optimizer/plan.h:26` | 枚举新增 `T_ShowIndex` |
+| Optimizer | `@/home/simpur/rmdb_2025/db2025/rmdb/src/optimizer/optimizer.h:41-43` | 路由到 `OtherPlan(T_ShowIndex, tab_name)` |
+| Execution | `@/home/simpur/rmdb_2025/db2025/rmdb/src/execution/execution_manager.cpp:93-97` | 派发 `T_ShowIndex` → `sm_manager_->show_index()` |
+| SM Manager | `@/home/simpur/rmdb_2025/db2025/rmdb/src/system/sm_manager.cpp:164-182` | 实现 `show_index()` |
 
-输出格式（参考 MySQL）：
+### AST 节点
+```cpp
+struct ShowIndex : public TreeNode {
+    std::string tab_name;
+    ShowIndex(std::string tab_name_) : tab_name(std::move(tab_name_)) {}
+};
 ```
-| Table | Key_name | Column_name |
-| t     | t_id     | id          |
+
+### Parser 规则
+```yacc
+dbStmt:
+    SHOW TABLES { $$ = std::make_shared<ShowTables>(); }
+  | SHOW INDEX FROM tbName { $$ = std::make_shared<ShowIndex>($4); }
+  ;
+```
+不需要新增任何 token（`SHOW`、`INDEX`、`FROM` 已存在）。
+
+### Optimizer 路由
+```cpp
+} else if (auto x = std::dynamic_pointer_cast<ast::ShowIndex>(query->parse)) {
+    return std::make_shared<OtherPlan>(T_ShowIndex, x->tab_name);
+}
+```
+复用 `OtherPlan`，`tab_name_` 携带表名。
+
+### SM Manager 实现
+```cpp
+void SmManager::show_index(const std::string& tab_name, Context* context) {
+    TabMeta &tab = db_.get_table(tab_name);
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    RecordPrinter printer(3);
+    printer.print_separator(context);
+    for (auto &index : tab.indexes) {
+        std::string idx_cols = "(";
+        for (int i = 0; i < index.col_num; ++i) {
+            if (i > 0) idx_cols += ",";
+            idx_cols += index.cols[i].name;
+        }
+        idx_cols += ")";
+        printer.print_record({tab_name, "unique", idx_cols}, context);
+        outfile << "| " << tab_name << " | unique | " << idx_cols << " |" << "\n";
+    }
+    printer.print_separator(context);
+    outfile.close();
+}
 ```
 
-具体实现等 Step 3/4 做完再推进。
+### 输出格式
+```
+| warehouse | unique | (id) |
+| warehouse | unique | (id,name) |
+```
+本项目所有索引都是唯一索引，所以第二列固定为 `unique`。
 
 ---
 
-## 七、自测问题
+## 七、Step 6（额外修复）— `TabMeta` 拷贝构造函数 Bug
+
+### 修改位置
+`@/home/simpur/rmdb_2025/db2025/rmdb/src/system/sm_meta.h:76-80`
+
+### 问题
+原始的 `TabMeta` 拷贝构造函数只拷贝了 `cols`，**没有拷贝 `indexes`**：
+```cpp
+TabMeta(const TabMeta &other) {
+    name = other.name;
+    for(auto col : other.cols) cols.push_back(col);
+    // indexes 完全丢失！
+}
+```
+
+### 影响范围
+`InsertExecutor`、`UpdateExecutor`、`DeleteExecutor` 的构造函数中都有：
+```cpp
+tab_ = sm_manager_->db_.get_table(tab_name);  // 触发拷贝构造
+```
+拷贝出来的 `tab_` 的 `indexes` 为空 → **所有唯一性检查和索引维护全部失效**。
+
+### 修复
+```cpp
+TabMeta(const TabMeta &other) {
+    name = other.name;
+    for(auto col : other.cols) cols.push_back(col);
+    for(auto idx : other.indexes) indexes.push_back(idx);  // ← 新增
+}
+```
+
+### 教训
+这是一个**隐蔽的浅拷贝遗漏 bug**。编译器不报错，运行时也不崩（只是 `tab_.indexes` 始终为空，循环直接跳过）。只有在做端到端测试时才能发现“唯一性约束不生效”。
+
+---
+
+## 八、测试点对照表
+
+| 测试点 | 功能 | 对应 Step | 状态 |
+|---|---|---|---|
+| 题目二·1 | 建表/删表/show tables | 原有 | ✅ |
+| 题目二·2 | 插入+条件查询 | 原有 | ✅ |
+| 题目二·3 | 更新+条件查询 | 原有 | ✅ |
+| 题目三·1 | create/drop/show index | Step 5 | ✅ |
+| 题目三·2 | 索引等值+范围查询 | 原有 IndexScan | ✅ |
+| 题目三·3 | 唯一性 failure | Step 1+2+3+6 | ✅ |
+| 题目三·4 | 单列索引加速 | 原有 planner | ✅ |
+| 题目三·5 | 多列索引加速 | 原有 planner | ✅ |
+
+### 编译与测试结果
+- **编译**：`make -j` 零错误
+- **executor_full_test**：40/40 通过
+- **sm_manager_test**：20/20 通过
+- **record_index_test**：20/20 通过
+- **integration_test**：26/26 通过
+- **总计**：106/106 通过
+
+---
+
+## 九、自测问题
 
 1. `IndexEntryDuplicateError` 为什么一定要继承 `RMDBError` 而不是 `std::runtime_error`？
 2. Step 2 中如果不缓存 keys，分两次算 key，可能出什么 bug？
@@ -270,15 +432,16 @@ for 每个 rid 要更新:
 
 ---
 
-## 八、历史记录
+## 十、历史记录
 
 | 日期 | 进度 |
 |---|---|
-| 2026-04-18 傍晚 | Step 1 `IndexEntryDuplicateError`；Step 2 `InsertExecutor` pre-check 两段式；端到端验证重复 key 被干净拦下 |
+| 2026-04-18 傍晚 | Step 1 `IndexEntryDuplicateError`；Step 2 `InsertExecutor` pre-check 两段式；端到端验证重复 key 被干净挡下 |
+| 2026-04-23 晚 | Step 3 `UpdateExecutor` 自身豁免查重；Step 5 `SHOW INDEX` 全链路（6层）；Step 6 修复 `TabMeta` 拷贝构造遗漏 indexes；全部 106 个测试通过 |
 
 ---
 
-## 九、与其他学习文档的关系
+## 十一、与其他学习文档的关系
 
 | 文档 | 相关章节 |
 |---|---|
@@ -289,4 +452,4 @@ for 每个 rid 要更新:
 
 ---
 
-**持续更新中。Step 3 完成后回来补第五章实现细节。**
+**全部完成。**
